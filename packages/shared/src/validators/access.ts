@@ -14,6 +14,10 @@ export const createCompanyInviteSchema = z.object({
   humanRole: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES).optional().nullable(),
   defaultsPayload: z.record(z.string(), z.unknown()).optional().nullable(),
   agentMessage: z.string().max(4000).optional().nullable(),
+  // When set, the resulting human invite requires manual approval and, once
+  // approved, restricts the invitee to this single agent's org-chart subtree
+  // instead of granting ordinary company-wide access.
+  restrictToAgentId: z.string().min(1).optional().nullable(),
 });
 
 export type CreateCompanyInvite = z.infer<typeof createCompanyInviteSchema>;
@@ -28,6 +32,9 @@ export type CreateOpenClawInvitePrompt = z.infer<
 
 export const acceptInviteSchema = z.object({
   requestType: z.enum(JOIN_REQUEST_TYPES),
+  // Used for agent-restricted human invites: lets someone request access with
+  // just an email address, with no Paperclip sign-in/sign-up required.
+  requestEmail: z.string().email().max(320).optional(),
   agentName: z.string().min(1).max(120).optional(),
   adapterType: optionalAgentAdapterTypeSchema,
   capabilities: z.string().max(4000).optional().nullable(),

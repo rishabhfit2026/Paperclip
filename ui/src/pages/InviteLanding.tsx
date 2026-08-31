@@ -124,6 +124,7 @@ type AwaitingJoinApprovalPanelProps = {
   companyLogoUrl: string | null;
   companyBrandColor: string | null;
   invitedByUserName: string | null;
+  restrictedAgentName?: string | null;
   claimSecret?: string | null;
   claimApiKeyPath?: string | null;
   onboardingTextUrl?: string | null;
@@ -156,6 +157,7 @@ function AwaitingJoinApprovalPanel({
   companyLogoUrl,
   companyBrandColor,
   invitedByUserName,
+  restrictedAgentName = null,
   claimSecret = null,
   claimApiKeyPath = null,
   onboardingTextUrl = null,
@@ -177,7 +179,8 @@ function AwaitingJoinApprovalPanel({
         </div>
         <div className="mt-4 space-y-3">
           <p className="text-sm text-zinc-400">
-            Your request is still awaiting approval. {approverLabel} must approve your request to join.
+            Your request is still awaiting approval. {approverLabel} must approve your request
+            {restrictedAgentName ? ` for access to ${restrictedAgentName}` : " to join"}.
           </p>
           <div className="border border-zinc-800 p-3">
             <p className="text-xs text-zinc-500 mb-1">Approval page</p>
@@ -222,6 +225,7 @@ export function InviteLandingPage() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [requestEmail, setRequestEmail] = useState("");
   const [agentName, setAgentName] = useState("");
   const [adapterType, setAdapterType] = useState<AgentAdapterType>("claude_local");
   const [capabilities, setCapabilities] = useState("");
@@ -285,12 +289,20 @@ export function InviteLandingPage() {
   const invitedByUserName = invite?.invitedByUserName?.trim() || null;
   const inviteMessage = invite?.inviteMessage?.trim() || null;
   const requestedHumanRole = formatHumanRole(invite?.humanRole);
+  const restrictedAgentName = invite?.restrictedAgentName?.trim() || null;
   const inviteJoinRequestStatus = invite?.joinRequestStatus ?? null;
   const inviteJoinRequestType = invite?.joinRequestType ?? null;
   const canCompleteAcceptedHumanInvite =
     inviteJoinRequestType === "human" &&
     (inviteJoinRequestStatus === "pending_approval" || inviteJoinRequestStatus === "approved");
+  // Agent-restricted invites are claimed with a typed email address, not the
+  // current browser session's identity, so they opt out of every
+  // session-driven path below (auto-accept, sign-up form) at every status,
+  // not just before the first submission.
+  const isRestrictedByAgent = Boolean(invite?.restrictedAgentId);
+  const showAgentRestrictedRequestForm = isRestrictedByAgent && !inviteJoinRequestStatus;
   const requiresHumanAccount =
+    !isRestrictedByAgent &&
     healthQuery.data?.deploymentMode === "authenticated" &&
     !sessionQuery.data &&
     invite?.allowedJoinTypes !== "agent";
@@ -298,12 +310,14 @@ export function InviteLandingPage() {
   const shouldAutoAcceptHumanInvite =
     Boolean(sessionQuery.data) &&
     !showsAgentForm &&
+    !isRestrictedByAgent &&
     invite?.inviteType !== "bootstrap_ceo" &&
     (!inviteJoinRequestStatus || canCompleteAcceptedHumanInvite) &&
     !isCheckingExistingMembership &&
     !isCurrentMember &&
     !result &&
     error === null;
+  const requestEmailCanSubmit = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(requestEmail.trim());
   const sessionLabel =
     sessionQuery.data?.user.name?.trim() ||
     sessionQuery.data?.user.email?.trim() ||
@@ -317,6 +331,12 @@ export function InviteLandingPage() {
   const acceptMutation = useMutation({
     mutationFn: async () => {
       if (!invite) throw new Error("Invite not found");
+      if (showAgentRestrictedRequestForm) {
+        return accessApi.acceptInvite(token, {
+          requestType: "human",
+          requestEmail: requestEmail.trim(),
+        });
+      }
       if (isCheckingExistingMembership) {
         throw new Error("Checking your company access. Try again in a moment.");
       }
@@ -357,6 +377,22 @@ export function InviteLandingPage() {
     setError(null);
     acceptMutation.mutate();
   }, [acceptMutation, autoAcceptStarted, shouldAutoAcceptHumanInvite]);
+
+  // Reopening an invite link (rather than just-submitted-it) that turns out
+  // to already be approved for this signed-in account renders "Opening
+  // company..." below — this is what actually finishes that instead of
+  // leaving it stuck on that message forever.
+  useEffect(() => {
+    if (
+      inviteJoinRequestStatus === "approved" &&
+      inviteJoinRequestType === "human" &&
+      isCurrentMember &&
+      invite?.companyId
+    ) {
+      setSelectedCompanyId(invite.companyId, { source: "manual" });
+      navigate("/", { replace: true });
+    }
+  }, [inviteJoinRequestStatus, inviteJoinRequestType, isCurrentMember, invite?.companyId, navigate, setSelectedCompanyId]);
 
   const authMutation = useMutation({
     mutationFn: async () => {
@@ -449,18 +485,41 @@ export function InviteLandingPage() {
     return <div className="mx-auto max-w-xl py-10 text-sm text-muted-foreground">Opening company...</div>;
   }
 
-  if (inviteJoinRequestStatus === "pending_approval" && !canCompleteAcceptedHumanInvite) {
+  // Agent-restricted requests never "complete" via a signed-in session — the
+  // request is either still pending, approved (with login not yet wired up),
+  // or rejected — so these two checks are terminal for them regardless of
+  // canCompleteAcceptedHumanInvite, which only applies to the account-based
+  // flow.
+  if (
+    inviteJoinRequestStatus === "pending_approval" &&
+    (isRestrictedByAgent || !canCompleteAcceptedHumanInvite)
+  ) {
     return (
       <AwaitingJoinApprovalPanel
         companyDisplayName={companyDisplayName}
         companyLogoUrl={companyLogoUrl}
         companyBrandColor={companyBrandColor}
         invitedByUserName={invitedByUserName}
+        restrictedAgentName={restrictedAgentName}
       />
     );
   }
 
-  if (inviteJoinRequestStatus && !canCompleteAcceptedHumanInvite) {
+  if (inviteJoinRequestStatus === "approved" && isRestrictedByAgent && !isCurrentMember) {
+    return (
+      <div className="mx-auto max-w-xl py-10">
+        <div className="border border-border bg-card p-6" data-testid="invite-request-approved">
+          <h1 className="text-lg font-semibold">Request approved</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Your request for access to {restrictedAgentName ?? "this agent"} in {companyDisplayName} was approved.
+            Signing in to use it isn't set up yet — check back here once that's ready.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (inviteJoinRequestStatus && !isRestrictedByAgent && !canCompleteAcceptedHumanInvite) {
     return (
       <div className="mx-auto max-w-xl py-10">
         <div className="border border-border bg-card p-6" data-testid="invite-error">
@@ -470,6 +529,17 @@ export function InviteLandingPage() {
               ? "This join request was not approved."
               : "This invite has already been used."}
           </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (inviteJoinRequestStatus === "rejected" && isRestrictedByAgent) {
+    return (
+      <div className="mx-auto max-w-xl py-10">
+        <div className="border border-border bg-card p-6" data-testid="invite-error">
+          <h1 className="text-lg font-semibold">Invite not available</h1>
+          <p className="mt-2 text-sm text-muted-foreground">This join request was not approved.</p>
         </div>
       </div>
     );
@@ -527,6 +597,7 @@ export function InviteLandingPage() {
           companyLogoUrl={companyLogoUrl}
           companyBrandColor={companyBrandColor}
           invitedByUserName={invitedByUserName}
+          restrictedAgentName={restrictedAgentName}
           claimSecret={claimSecret}
           claimApiKeyPath={claimApiKeyPath}
           onboardingTextUrl={onboardingTextUrl}
@@ -576,7 +647,11 @@ export function InviteLandingPage() {
               <div className="border border-zinc-800 p-3">
                 <div className="text-xs uppercase tracking-(--tracking-caps) text-zinc-500">Requested access</div>
                 <div className="mt-1 text-sm text-zinc-100">
-                  {showsAgentForm ? "Agent join request" : requestedHumanRole ?? "Company access"}
+                  {showsAgentForm
+                    ? "Agent join request"
+                    : restrictedAgentName
+                      ? `${requestedHumanRole ?? "Operator"} access to ${restrictedAgentName} only`
+                      : requestedHumanRole ?? "Company access"}
                 </div>
               </div>
               <div className="border border-zinc-800 p-3">
@@ -647,6 +722,51 @@ export function InviteLandingPage() {
                 >
                   {acceptMutation.isPending ? "Working..." : joinButtonLabel}
                 </Button>
+              </div>
+            ) : showAgentRestrictedRequestForm ? (
+              <div className="space-y-4">
+                <div>
+                  <h2 className="text-lg font-semibold">Request access</h2>
+                  <p className="mt-1 text-sm text-zinc-400">
+                    Enter your email and request access to {restrictedAgentName ?? "this agent"}. No account or
+                    password needed yet — {invitedByUserName ?? "the company"} will review your request and approve
+                    or reject it.
+                  </p>
+                </div>
+                <form
+                  className="space-y-4"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    if (acceptMutation.isPending || !requestEmailCanSubmit) return;
+                    acceptMutation.mutate();
+                  }}
+                >
+                  <label className="block text-sm" htmlFor="invite-request-email">
+                    <span className="mb-1 block text-zinc-400">Email</span>
+                    <input
+                      id="invite-request-email"
+                      type="email"
+                      className={fieldClassName}
+                      value={requestEmail}
+                      onChange={(event) => {
+                        setRequestEmail(event.target.value);
+                        setError(null);
+                      }}
+                      autoComplete="email"
+                      required
+                      aria-required="true"
+                      autoFocus
+                    />
+                  </label>
+                  {error ? <p className="text-xs text-red-400">{error}</p> : null}
+                  <Button
+                    type="submit"
+                    className="w-full rounded-none"
+                    disabled={acceptMutation.isPending || !requestEmailCanSubmit}
+                  >
+                    {acceptMutation.isPending ? "Submitting..." : "Request access"}
+                  </Button>
+                </form>
               </div>
             ) : requiresHumanAccount ? (
               <div className="space-y-5">

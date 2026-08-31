@@ -1695,6 +1695,12 @@ describe.sequential("agent permission routes", () => {
       // the read-only permission loosening introduced by this PR.
       mockAccessService.canUser.mockResolvedValue(false);
       mockAccessService.hasPermission.mockResolvedValue(false);
+      mockAccessService.decide.mockResolvedValue({
+        allowed: true,
+        action: "agent:read",
+        reason: "allow_simple_company_member",
+        explanation: "Allowed by standard same-company board membership visibility.",
+      });
 
       const app = await createApp({
         type: "board",

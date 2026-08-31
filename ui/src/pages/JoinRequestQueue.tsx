@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { UserPlus2 } from "lucide-react";
+import { Copy, UserPlus2 } from "lucide-react";
 import { accessApi } from "@/api/access";
 import { ApiError } from "@/api/client";
 import { Button } from "@/components/ui/button";
@@ -9,6 +9,7 @@ import { Card } from "@/components/ui/card";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
 import { useToast } from "@/context/ToastContext";
+import { copyTextToClipboard } from "@/lib/clipboard";
 import { queryKeys } from "@/lib/queryKeys";
 
 export function JoinRequestQueue() {
@@ -18,6 +19,7 @@ export function JoinRequestQueue() {
   const queryClient = useQueryClient();
   const [status, setStatus] = useState<"pending_approval" | "approved" | "rejected">("pending_approval");
   const [requestType, setRequestType] = useState<"all" | "human" | "agent">("all");
+  const [magicLinksByRequestId, setMagicLinksByRequestId] = useState<Record<string, string>>({});
 
   useEffect(() => {
     setBreadcrumbs([
@@ -40,11 +42,18 @@ export function JoinRequestQueue() {
 
   const approveMutation = useMutation({
     mutationFn: (requestId: string) => accessApi.approveJoinRequest(selectedCompanyId!, requestId),
-    onSuccess: async () => {
+    onSuccess: async (approved, requestId) => {
+      if (approved.magicLinkUrl) {
+        setMagicLinksByRequestId((prev) => ({ ...prev, [requestId]: approved.magicLinkUrl! }));
+      }
       await queryClient.invalidateQueries({ queryKey: queryKeys.access.joinRequests(selectedCompanyId!, `${status}:${requestType}`) });
       await queryClient.invalidateQueries({ queryKey: queryKeys.access.companyMembers(selectedCompanyId!) });
       await queryClient.invalidateQueries({ queryKey: queryKeys.access.companyUserDirectory(selectedCompanyId!) });
-      pushToast({ title: "Join request approved", tone: "success" });
+      pushToast({
+        title: "Join request approved",
+        body: approved.magicLinkUrl ? "Copy the access link below and send it to them." : undefined,
+        tone: "success",
+      });
     },
   });
 
@@ -53,6 +62,21 @@ export function JoinRequestQueue() {
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.access.joinRequests(selectedCompanyId!, `${status}:${requestType}`) });
       pushToast({ title: "Join request rejected", tone: "success" });
+    },
+  });
+
+  const generateAccessLinkMutation = useMutation({
+    mutationFn: (requestId: string) => accessApi.generateJoinRequestAccessLink(selectedCompanyId!, requestId),
+    onSuccess: (result, requestId) => {
+      setMagicLinksByRequestId((prev) => ({ ...prev, [requestId]: result.magicLinkUrl }));
+      pushToast({ title: "Access link generated", body: "Copy it below and send it to them.", tone: "success" });
+    },
+    onError: (error) => {
+      pushToast({
+        title: "Couldn't generate access link",
+        body: error instanceof Error ? error.message : undefined,
+        tone: "error",
+      });
     },
   });
 
@@ -133,6 +157,9 @@ export function JoinRequestQueue() {
                     </Badge>
                     <Badge variant="outline">{request.requestType}</Badge>
                     {request.adapterType ? <Badge variant="outline">{request.adapterType}</Badge> : null}
+                    {request.requestType === "human" && request.invite?.restrictedAgentName ? (
+                      <Badge variant="secondary">Restricted to {request.invite.restrictedAgentName}</Badge>
+                    ) : null}
                   </div>
                   <div>
                     <div className="text-base font-medium">
@@ -145,6 +172,11 @@ export function JoinRequestQueue() {
                         ? request.requesterUser?.email || request.requestEmailSnapshot || request.requestingUserId
                         : request.capabilities || request.requestIp}
                     </div>
+                    {request.requestType === "human" && request.invite?.restrictedAgentName ? (
+                      <div className="text-sm text-foreground">
+                        Requesting access to <span className="font-medium">{request.invite.restrictedAgentName}</span> only
+                      </div>
+                    ) : null}
                   </div>
                 </div>
 
@@ -164,8 +196,54 @@ export function JoinRequestQueue() {
                       Approve
                     </Button>
                   </div>
+                ) : request.status === "approved" &&
+                  request.requestType === "human" &&
+                  request.invite?.restrictedAgentName ? (
+                  <Button
+                    variant="outline"
+                    onClick={() => generateAccessLinkMutation.mutate(request.id)}
+                    disabled={generateAccessLinkMutation.isPending}
+                  >
+                    {magicLinksByRequestId[request.id] ? "Regenerate access link" : "Generate access link"}
+                  </Button>
                 ) : null}
               </div>
+
+              {magicLinksByRequestId[request.id] ? (
+                <div className="mt-4 space-y-2 rounded-lg border border-border bg-background px-3 py-3">
+                  <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Access link — send this to them yourself
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      readOnly
+                      value={magicLinksByRequestId[request.id]}
+                      onFocus={(event) => event.currentTarget.select()}
+                      onClick={(event) => event.currentTarget.select()}
+                      className="min-w-0 flex-1 rounded-md border border-border bg-muted/60 px-3 py-2 text-sm text-foreground outline-none"
+                    />
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={async () => {
+                        try {
+                          await copyTextToClipboard(magicLinksByRequestId[request.id]);
+                          pushToast({ title: "Access link copied", tone: "success" });
+                        } catch {
+                          pushToast({ title: "Couldn't copy link", body: "Copy it manually from the field.", tone: "warn" });
+                        }
+                      }}
+                    >
+                      <Copy className="h-4 w-4" />
+                      Copy link
+                    </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    One-time and expires soon — there's no email delivery yet, so relay it yourself.
+                  </p>
+                </div>
+              ) : null}
 
               <div className="mt-4 grid gap-3 text-sm text-muted-foreground md:grid-cols-2">
                 <div className="rounded-lg border border-border bg-background px-3 py-2">

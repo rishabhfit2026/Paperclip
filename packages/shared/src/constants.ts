@@ -935,6 +935,7 @@ export const PERMISSION_KEYS = [
   "tasks:manage_active_checkouts",
   "pipelines:write",
   "joins:approve",
+  "company:member_scope",
 ] as const;
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
 

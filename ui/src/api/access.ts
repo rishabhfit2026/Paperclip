@@ -12,6 +12,8 @@ type InviteSummary = {
   inviteType: "company_join" | "bootstrap_ceo";
   allowedJoinTypes: "human" | "agent" | "both";
   humanRole?: HumanCompanyRole | null;
+  restrictedAgentId?: string | null;
+  restrictedAgentName?: string | null;
   expiresAt: string;
   onboardingPath?: string;
   onboardingUrl?: string;
@@ -26,7 +28,7 @@ type InviteSummary = {
 };
 
 type AcceptInviteInput =
-  | { requestType: "human" }
+  | { requestType: "human"; requestEmail?: string }
   | {
     requestType: "agent";
     agentName: string;
@@ -164,6 +166,8 @@ export type CompanyInviteRecord = {
   inviteType: "company_join" | "bootstrap_ceo";
   allowedJoinTypes: "human" | "agent" | "both";
   humanRole: HumanCompanyRole | null;
+  restrictedAgentId: string | null;
+  restrictedAgentName: string | null;
   defaultsPayload: Record<string, unknown> | null;
   expiresAt: string;
   invitedByUserId: string | null;
@@ -191,6 +195,8 @@ export type CompanyJoinRequest = JoinRequest & {
     inviteType: "company_join" | "bootstrap_ceo";
     allowedJoinTypes: "human" | "agent" | "both";
     humanRole: HumanCompanyRole | null;
+    restrictedAgentId: string | null;
+    restrictedAgentName: string | null;
     inviteMessage: string | null;
     createdAt: string;
     expiresAt: string;
@@ -268,6 +274,7 @@ export const accessApi = {
       humanRole?: HumanCompanyRole | null;
       defaultsPayload?: Record<string, unknown> | null;
       agentMessage?: string | null;
+      restrictToAgentId?: string | null;
     } = {},
   ) =>
     api.post<CompanyInviteCreated>(`/companies/${companyId}/invites`, input),
@@ -367,10 +374,19 @@ export const accessApi = {
   ) => api.post<ArchiveCompanyMemberResponse>(`/companies/${companyId}/members/${memberId}/archive`, input),
 
   approveJoinRequest: (companyId: string, requestId: string) =>
-    api.post<JoinRequest>(`/companies/${companyId}/join-requests/${requestId}/approve`, {}),
+    api.post<JoinRequest & { magicLinkUrl?: string | null }>(
+      `/companies/${companyId}/join-requests/${requestId}/approve`,
+      {},
+    ),
 
   rejectJoinRequest: (companyId: string, requestId: string) =>
     api.post<JoinRequest>(`/companies/${companyId}/join-requests/${requestId}/reject`, {}),
+
+  generateJoinRequestAccessLink: (companyId: string, requestId: string) =>
+    api.post<{ magicLinkUrl: string }>(
+      `/companies/${companyId}/join-requests/${requestId}/magic-link`,
+      {},
+    ),
 
   claimJoinRequestApiKey: (requestId: string, claimSecret: string) =>
     api.post<{ keyId: string; token: string; agentId: string; createdAt: string }>(

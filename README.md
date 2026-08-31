@@ -125,6 +125,21 @@ Monitor and manage your autonomous businesses from anywhere.
 
 <br/>
 
+## Agent-Scoped Access
+
+Give someone access to exactly one agent — not the rest of the company, not your other agents, nothing else.
+
+1. **Create a restricted invite.** In Company Settings → Invites, pick "Restrict to agent" and choose the one agent this link is for. The link expires in 10 minutes and is single-use.
+2. **They request access with just an email.** No Paperclip account or password needed up front — they open the link, type their email, and hit "Request access."
+3. **You review it.** The request shows up in the Join Request Queue with their email attached, next to Approve/Reject buttons — same as any other join request.
+4. **Approve, then relay the access link.** Approving generates a one-time sign-in link (also available anytime after via "Generate access link" on the request). Copy it and send it to them yourself — clicking it logs them straight into that one agent and nothing else in the company is visible to their account.
+
+**Requirements:** this needs the instance running in `authenticated` deployment mode (see [deployment modes](docs/deploy/deployment-modes.md)) — `local_trusted` mode has no concept of a second real identity, so it'll only exercise the request/approve steps without a working login at the end.
+
+**A couple of things to know:** there's no outbound email integration yet, so the access link has to be copied and relayed manually (Slack, email, whatever you use); and since it's single-use, avoid sending it through chat apps that auto-preview links (Skype, Teams, etc.) — the preview fetch can silently consume it before the recipient ever clicks.
+
+<br/>
+
 ## Problems Paperclip solves
 
 | Without Paperclip                                                                                                                     | With Paperclip                                                                                                                         |
@@ -190,7 +205,7 @@ Paperclip is a full control plane, not a wrapper. Before you build any of this y
 <tr>
 <td width="50%">
 
-**Identity & Access** — Two deployment modes (trusted local or authenticated), board users, agent API keys, short-lived run JWTs, company memberships, invite flows, and OpenClaw onboarding. Every mutating request is traced to an actor.
+**Identity & Access** — Two deployment modes (trusted local or authenticated), board users, agent API keys, short-lived run JWTs, company memberships, invite flows (including single-agent-scoped invites), and OpenClaw onboarding. Every mutating request is traced to an actor.
 
 </td>
 <td width="50%">

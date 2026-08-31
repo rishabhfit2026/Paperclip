@@ -18,6 +18,7 @@ const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
   decide: vi.fn(),
   hasPermission: vi.fn(),
+  getMemberScopeRootAgentId: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -248,6 +249,8 @@ describe.sequential("issue comment reopen routes", () => {
     mockAccessService.canUser.mockReset();
     mockAccessService.decide.mockReset();
     mockAccessService.hasPermission.mockReset();
+    mockAccessService.getMemberScopeRootAgentId.mockReset();
+    mockAccessService.getMemberScopeRootAgentId.mockResolvedValue(null);
     mockHeartbeatService.wakeup.mockReset();
     mockHeartbeatService.reportRunActivity.mockReset();
     mockHeartbeatService.getRun.mockReset();

@@ -3434,7 +3434,24 @@ export function issueRoutes(
       assigneeUserId: string | null;
     },
   ) {
-    if (req.actor.type !== "agent") return true;
+    if (req.actor.type !== "agent") {
+      // Board actors are otherwise unconditionally allowed to comment here,
+      // but a member restricted to an agent subtree (company:member_scope)
+      // must still be bounded to it — check for that grant explicitly
+      // rather than always calling decideIssueAccess, since that would
+      // change behavior for ordinary (unscoped) board members too.
+      if (req.actor.type === "board" && req.actor.userId) {
+        const rootAgentId = await access.getMemberScopeRootAgentId(issue.companyId, req.actor.userId);
+        if (rootAgentId) {
+          const scopeDecision = await decideIssueAccess(req, issue, "issue:comment");
+          if (!scopeDecision.allowed) {
+            res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+            return false;
+          }
+        }
+      }
+      return true;
+    }
     const actorAgentId = req.actor.agentId;
     if (!actorAgentId) {
       res.status(403).json({ error: "Agent authentication required" });
@@ -3515,7 +3532,24 @@ export function issueRoutes(
       assigneeUserId: string | null;
     },
   ) {
-    if (req.actor.type !== "agent") return true;
+    if (req.actor.type !== "agent") {
+      // Board actors are otherwise unconditionally allowed to mutate here,
+      // but a member restricted to an agent subtree (company:member_scope)
+      // must still be bounded to it — check for that grant explicitly
+      // rather than always calling decideIssueAccess, since that would
+      // change behavior for ordinary (unscoped) board members too.
+      if (req.actor.type === "board" && req.actor.userId) {
+        const rootAgentId = await access.getMemberScopeRootAgentId(issue.companyId, req.actor.userId);
+        if (rootAgentId) {
+          const scopeDecision = await decideIssueAccess(req, issue, "issue:mutate");
+          if (!scopeDecision.allowed) {
+            res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+            return false;
+          }
+        }
+      }
+      return true;
+    }
     const actorAgentId = req.actor.agentId;
     if (!actorAgentId) {
       res.status(403).json({ error: "Agent authentication required" });

@@ -39,6 +39,7 @@ export function CompanyAccess() {
   const [reassignmentTarget, setReassignmentTarget] = useState<string>("__unassigned");
   const [draftRole, setDraftRole] = useState<CompanyMember["membershipRole"]>(null);
   const [draftStatus, setDraftStatus] = useState<EditableMemberStatus>("active");
+  const [draftRestrictToAgentId, setDraftRestrictToAgentId] = useState<string | null>(null);
 
   useEffect(() => {
     setBreadcrumbs([
@@ -74,10 +75,23 @@ export function CompanyAccess() {
   };
 
   const updateMemberMutation = useMutation({
-    mutationFn: async (input: { memberId: string; membershipRole: CompanyMember["membershipRole"]; status: EditableMemberStatus }) => {
-      return accessApi.updateMember(selectedCompanyId!, input.memberId, {
+    mutationFn: async (input: {
+      memberId: string;
+      membershipRole: CompanyMember["membershipRole"];
+      status: EditableMemberStatus;
+      restrictToAgentId: string | null;
+      existingGrants: CompanyMember["grants"];
+    }) => {
+      const otherGrants = input.existingGrants
+        .filter((grant) => grant.permissionKey !== "company:member_scope")
+        .map((grant) => ({ permissionKey: grant.permissionKey, scope: grant.scope }));
+      const grants = input.restrictToAgentId
+        ? [...otherGrants, { permissionKey: "company:member_scope" as const, scope: { rootAgentId: input.restrictToAgentId } }]
+        : otherGrants;
+      return accessApi.updateMemberAccess(selectedCompanyId!, input.memberId, {
         membershipRole: input.membershipRole,
         status: input.status,
+        grants,
       });
     },
     onSuccess: async () => {
@@ -193,6 +207,9 @@ export function CompanyAccess() {
     if (!editingMember) return;
     setDraftRole(editingMember.membershipRole);
     setDraftStatus(isEditableMemberStatus(editingMember.status) ? editingMember.status : "suspended");
+    const scopeGrant = editingMember.grants.find((grant) => grant.permissionKey === "company:member_scope");
+    const rootAgentId = scopeGrant?.scope?.rootAgentId;
+    setDraftRestrictToAgentId(typeof rootAgentId === "string" ? rootAgentId : null);
   }, [editingMember]);
 
   useEffect(() => {
@@ -411,6 +428,24 @@ export function CompanyAccess() {
                   </select>
                 </label>
               </div>
+              <label className="block space-y-2 text-sm">
+                <span className="font-medium">Restrict to agent</span>
+                <select
+                  className="w-full rounded-md border border-border bg-background px-3 py-2"
+                  value={draftRestrictToAgentId ?? ""}
+                  onChange={(event) => setDraftRestrictToAgentId(event.target.value || null)}
+                >
+                  <option value="">None — full company access (default)</option>
+                  {(agentsQuery.data ?? []).filter(isAssignableAgent).map((agent) => (
+                    <option key={agent.id} value={agent.id}>
+                      {agent.name} ({agent.role})
+                    </option>
+                  ))}
+                </select>
+                <span className="block text-xs text-muted-foreground">
+                  When set, this member can only see and act on the chosen agent and everything reporting up to it — not the rest of the company.
+                </span>
+              </label>
             </div>
           )}
           <DialogFooter>
@@ -424,6 +459,8 @@ export function CompanyAccess() {
                   memberId: editingMember.id,
                   membershipRole: draftRole,
                   status: draftStatus,
+                  restrictToAgentId: draftRestrictToAgentId,
+                  existingGrants: editingMember.grants,
                 });
               }}
               disabled={updateMemberMutation.isPending}

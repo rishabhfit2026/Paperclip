@@ -170,6 +170,7 @@ export async function createApp(
     pluginWorkerManager?: PluginWorkerManager;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
+    issueMagicLink?: (input: { email: string; callbackURL: string; baseUrl: string }) => Promise<string>;
   },
 ) {
   const app = express();
@@ -384,6 +385,7 @@ export async function createApp(
       deploymentExposure: opts.deploymentExposure,
       bindHost: opts.bindHost,
       allowedHostnames: opts.allowedHostnames,
+      issueMagicLink: opts.issueMagicLink,
     }),
   );
   app.use("/api", api);

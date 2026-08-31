@@ -2,6 +2,7 @@ import {
   createHash,
   generateKeyPairSync,
   randomBytes,
+  randomUUID,
   timingSafeEqual
 } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
@@ -103,6 +104,10 @@ const INVITE_TOKEN_PREFIX = "pcp_invite_";
 const INVITE_TOKEN_ENTROPY_BYTES = 32;
 const INVITE_TOKEN_MAX_RETRIES = 5;
 const COMPANY_INVITE_TTL_MS = 72 * 60 * 60 * 1000;
+// Agent-restricted invite links are meant to be handed to one specific
+// person for one-time use, so they carry a much shorter fuse than ordinary
+// company invites.
+const AGENT_RESTRICTED_INVITE_TTL_MS = 10 * 60 * 1000;
 const INVITE_RESOLUTION_DNS_TIMEOUT_MS = 3_000;
 
 type MemberGrantPayload = {
@@ -1098,6 +1103,8 @@ function toInviteSummaryResponse(
     inviteType: invite.inviteType,
     allowedJoinTypes: invite.allowedJoinTypes,
     humanRole: extractInviteHumanRole(invite),
+    restrictedAgentId: extractInviteRestrictedAgentId(invite),
+    restrictedAgentName: extractInviteRestrictedAgentName(invite),
     expiresAt: invite.expiresAt,
     invitePath,
     inviteUrl: baseUrl ? `${baseUrl}${invitePath}` : invitePath,
@@ -1454,6 +1461,8 @@ async function loadCompanyInviteRecords(
       ...invite,
       companyName,
       humanRole: extractInviteHumanRole(invite),
+      restrictedAgentId: extractInviteRestrictedAgentId(invite),
+      restrictedAgentName: extractInviteRestrictedAgentName(invite),
       inviteMessage: extractInviteMessage(invite),
       state: inviteState(invite),
       invitedByUser: invite.invitedByUserId
@@ -1512,6 +1521,8 @@ async function loadJoinRequestRecords(db: Db, companyId: string) {
             inviteType: invite.inviteType,
             allowedJoinTypes: invite.allowedJoinTypes,
             humanRole: extractInviteHumanRole(invite),
+            restrictedAgentId: extractInviteRestrictedAgentId(invite),
+            restrictedAgentName: extractInviteRestrictedAgentName(invite),
             inviteMessage: extractInviteMessage(invite),
             createdAt: invite.createdAt,
             expiresAt: invite.expiresAt,
@@ -2038,6 +2049,7 @@ function mergeInviteDefaults(
   defaultsPayload: Record<string, unknown> | null | undefined,
   agentMessage: string | null,
   humanRole: "owner" | "admin" | "operator" | "viewer" | null = null,
+  restrictToAgent: { id: string; name: string } | null = null,
 ): Record<string, unknown> | null {
   const merged =
     defaultsPayload && typeof defaultsPayload === "object"
@@ -2046,16 +2058,52 @@ function mergeInviteDefaults(
   if (humanRole) {
     const existingHuman =
       isPlainObject(merged.human) ? { ...(merged.human as Record<string, unknown>) } : {};
+    const grants = restrictToAgent
+      ? [
+          ...grantsForHumanRole(humanRole),
+          {
+            permissionKey: "company:member_scope" as const,
+            scope: { rootAgentId: restrictToAgent.id },
+          },
+        ]
+      : grantsForHumanRole(humanRole);
     merged.human = {
       ...existingHuman,
       role: humanRole,
-      grants: grantsForHumanRole(humanRole),
+      grants,
+      restrictedAgentId: restrictToAgent?.id ?? null,
+      restrictedAgentName: restrictToAgent?.name ?? null,
     };
   }
   if (agentMessage) {
     merged.agentMessage = agentMessage;
   }
   return Object.keys(merged).length ? merged : null;
+}
+
+// A restricted human invite must be reviewed by a company approver before it
+// grants access, instead of the normal immediate-role-on-accept behavior —
+// this reads the agent-subtree restriction stashed by mergeInviteDefaults.
+function extractInviteRestrictedAgentId(
+  invite: typeof invites.$inferSelect,
+): string | null {
+  const defaults = invite.defaultsPayload;
+  if (!defaults || typeof defaults !== "object" || Array.isArray(defaults)) return null;
+  const human = (defaults as Record<string, unknown>).human;
+  if (!human || typeof human !== "object") return null;
+  const id = (human as Record<string, unknown>).restrictedAgentId;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+function extractInviteRestrictedAgentName(
+  invite: typeof invites.$inferSelect,
+): string | null {
+  const defaults = invite.defaultsPayload;
+  if (!defaults || typeof defaults !== "object" || Array.isArray(defaults)) return null;
+  const human = (defaults as Record<string, unknown>).human;
+  if (!human || typeof human !== "object") return null;
+  const name = (human as Record<string, unknown>).restrictedAgentName;
+  return typeof name === "string" && name.length > 0 ? name : null;
 }
 
 function requestIp(req: Request) {
@@ -2119,6 +2167,37 @@ async function resolveActorEmail(db: Db, req: Request): Promise<string | null> {
     .where(eq(authUsers.id, userId))
     .then((rows) => rows[0] ?? null);
   return user?.email ?? null;
+}
+
+// Agent-restricted join requests can be submitted with just an email — no
+// Paperclip account exists yet at request time. On approval we need a real
+// user id to attach the membership/grant to, so this finds an existing
+// account for that email or provisions a bare one (no login credential;
+// claiming a working login for it is a separate, later step).
+async function resolveOrCreateUserIdForEmail(db: Db, email: string): Promise<string> {
+  const normalized = email.trim().toLowerCase();
+  const existing = await db
+    .select({ id: authUsers.id })
+    .from(authUsers)
+    .where(sql`lower(${authUsers.email}) = ${normalized}`)
+    .then((rows) => rows[0] ?? null);
+  if (existing) return existing.id;
+
+  const now = new Date();
+  const created = await db
+    .insert(authUsers)
+    .values({
+      id: `user-${randomUUID()}`,
+      name: normalized.split("@")[0] || normalized,
+      email: normalized,
+      emailVerified: false,
+      image: null,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .returning({ id: authUsers.id })
+    .then((rows) => rows[0]!);
+  return created.id;
 }
 
 async function resolveAcceptedInviteJoinRequest(
@@ -2604,6 +2683,7 @@ export function accessRoutes(
     allowedHostnames: string[];
     inviteResolutionNetwork?: Partial<InviteResolutionNetwork>;
     inviteRateLimiter?: InviteRateLimiter;
+    issueMagicLink?: (input: { email: string; callbackURL: string; baseUrl: string }) => Promise<string>;
   }
 ) {
   const router = Router();
@@ -3031,6 +3111,7 @@ export function accessRoutes(
     humanRole?: "owner" | "admin" | "operator" | "viewer" | null;
     defaultsPayload?: Record<string, unknown> | null;
     agentMessage?: string | null;
+    restrictToAgent?: { id: string; name: string } | null;
   }) {
     const normalizedAgentMessage =
       typeof input.agentMessage === "string"
@@ -3048,8 +3129,12 @@ export function accessRoutes(
         input.defaultsPayload ?? null,
         normalizedAgentMessage,
         effectiveHumanRole,
+        input.allowedJoinTypes === "agent" ? null : input.restrictToAgent ?? null,
       ),
-      expiresAt: companyInviteExpiresAt(),
+      expiresAt:
+        input.allowedJoinTypes !== "agent" && input.restrictToAgent
+          ? new Date(Date.now() + AGENT_RESTRICTED_INVITE_TTL_MS)
+          : companyInviteExpiresAt(),
       invitedByUserId: input.req.actor.userId ?? null
     };
 
@@ -3284,6 +3369,20 @@ export function accessRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       await assertCompanyPermission(req, companyId, "users:invite");
+
+      const restrictToAgentId = req.body.restrictToAgentId ?? null;
+      if (restrictToAgentId && req.body.allowedJoinTypes === "agent") {
+        throw badRequest("restrictToAgentId only applies to human invites");
+      }
+      let restrictToAgent: { id: string; name: string } | null = null;
+      if (restrictToAgentId) {
+        const agent = await agents.getById(restrictToAgentId);
+        if (!agent || agent.companyId !== companyId) {
+          throw badRequest("restrictToAgentId must reference an agent in this company");
+        }
+        restrictToAgent = { id: agent.id, name: agent.name };
+      }
+
       const { token, created, normalizedAgentMessage } =
         await createCompanyInviteForCompany({
           req,
@@ -3291,7 +3390,8 @@ export function accessRoutes(
           allowedJoinTypes: req.body.allowedJoinTypes,
           humanRole: req.body.humanRole ?? null,
           defaultsPayload: req.body.defaultsPayload ?? null,
-          agentMessage: req.body.agentMessage ?? null
+          agentMessage: req.body.agentMessage ?? null,
+          restrictToAgent
         });
 
       await logActivity(db, {
@@ -3309,7 +3409,8 @@ export function accessRoutes(
           allowedJoinTypes: created.allowedJoinTypes,
           expiresAt: created.expiresAt.toISOString(),
           humanRole: extractInviteHumanRole(created),
-          hasAgentMessage: Boolean(normalizedAgentMessage)
+          hasAgentMessage: Boolean(normalizedAgentMessage),
+          restrictedAgentId: extractInviteRestrictedAgentId(created)
         }
       });
 
@@ -3681,23 +3782,41 @@ export function accessRoutes(
         throw badRequest(`Invite does not allow ${requestType} joins`);
       }
 
-      if (requestType === "human" && req.actor.type !== "board") {
-        throw unauthorized(
-          "Human invite acceptance requires authenticated user"
-        );
-      }
-      if (
-        requestType === "human" &&
-        !req.actor.userId &&
-        !isLocalImplicit(req)
-      ) {
-        throw unauthorized("Authenticated user is required");
-      }
-      if (
-        requestType === "human" &&
-        actorHasActiveUserMembership(req, companyId)
-      ) {
-        throw conflict("You already belong to this company");
+      // Agent-restricted invites can be claimed with nothing but a typed
+      // email address — the request is tied to that email, not to whoever
+      // is signed into this browser, so the usual authenticated-user checks
+      // below don't apply to this path.
+      const restrictedAgentId = extractInviteRestrictedAgentId(invite);
+      const normalizedRequestEmail =
+        typeof req.body.requestEmail === "string"
+          ? req.body.requestEmail.trim().toLowerCase()
+          : null;
+      const isEmailOnlyAgentRequest =
+        requestType === "human" && Boolean(restrictedAgentId);
+
+      if (isEmailOnlyAgentRequest) {
+        if (!normalizedRequestEmail) {
+          throw badRequest("An email address is required to request access");
+        }
+      } else {
+        if (requestType === "human" && req.actor.type !== "board") {
+          throw unauthorized(
+            "Human invite acceptance requires authenticated user"
+          );
+        }
+        if (
+          requestType === "human" &&
+          !req.actor.userId &&
+          !isLocalImplicit(req)
+        ) {
+          throw unauthorized("Authenticated user is required");
+        }
+        if (
+          requestType === "human" &&
+          actorHasActiveUserMembership(req, companyId)
+        ) {
+          throw conflict("You already belong to this company");
+        }
       }
       if (requestType === "agent" && !req.body.agentName) {
         if (
@@ -3709,10 +3828,16 @@ export function accessRoutes(
       }
 
       const actorEmail =
-        requestType === "human" ? await resolveActorEmail(db, req) : null;
+        requestType === "human"
+          ? isEmailOnlyAgentRequest
+            ? normalizedRequestEmail
+            : await resolveActorEmail(db, req)
+          : null;
       const actorRequestingUserId =
         requestType === "human"
-          ? req.actor.userId ?? "local-board"
+          ? isEmailOnlyAgentRequest
+            ? null
+            : req.actor.userId ?? "local-board"
           : null;
       const canReplayHumanInviteAccept =
         inviteAlreadyAccepted &&
@@ -3875,9 +4000,7 @@ export function accessRoutes(
                   status: "pending_approval",
                   requestIp: requestIp(req),
                   requestingUserId:
-                    requestType === "human"
-                      ? req.actor.userId ?? "local-board"
-                      : null,
+                    requestType === "human" ? actorRequestingUserId : null,
                   requestEmailSnapshot:
                     requestType === "human" ? actorEmail : null,
                   agentName:
@@ -4032,8 +4155,10 @@ export function accessRoutes(
         actorId:
           req.actor.type === "agent"
             ? req.actor.agentId ?? "invite-agent"
-            : req.actor.userId ??
-              (requestType === "agent" ? "invite-anon" : "board"),
+            : isEmailOnlyAgentRequest
+              ? "invite-anon"
+              : req.actor.userId ??
+                (requestType === "agent" ? "invite-anon" : "board"),
         action: inviteAlreadyAccepted
           ? "join.request_replayed"
           : "join.requested",
@@ -4048,7 +4173,12 @@ export function accessRoutes(
         }
       });
 
-      if (requestType === "human") {
+      // Invites restricted to a single agent's subtree skip the usual
+      // immediate-approval path: they need a company approver to review the
+      // requester's identity before the member_scope grant takes effect, so
+      // the join request stays pending_approval for the queue in
+      // /companies/:companyId/join-requests to pick up.
+      if (requestType === "human" && !extractInviteRestrictedAgentId(invite)) {
         created = await approveHumanJoinRequestFromInvite({
           req,
           invite,
@@ -4179,16 +4309,31 @@ export function accessRoutes(
       if (!invite) throw notFound("Invite not found");
 
       let createdAgentId: string | null = existing.createdAgentId ?? null;
+      let magicLinkUrl: string | null = null;
       if (existing.requestType === "human") {
-        if (!existing.requestingUserId)
+        // Email-only agent-restricted requests have no user account yet at
+        // request time; resolve or provision one now, and backfill it onto
+        // the join request row so later reads see the real identity.
+        const requestingUserId =
+          existing.requestingUserId ??
+          (existing.requestEmailSnapshot
+            ? await resolveOrCreateUserIdForEmail(db, existing.requestEmailSnapshot)
+            : null);
+        if (!requestingUserId)
           throw conflict("Join request missing user identity");
+        if (!existing.requestingUserId) {
+          await db
+            .update(joinRequests)
+            .set({ requestingUserId, updatedAt: new Date() })
+            .where(eq(joinRequests.id, existing.id));
+        }
         const membershipRole = resolveHumanInviteRole(
           invite.defaultsPayload as Record<string, unknown> | null,
         );
         await access.ensureMembership(
           companyId,
           "user",
-          existing.requestingUserId,
+          requestingUserId,
           membershipRole,
           "active"
         );
@@ -4199,10 +4344,29 @@ export function accessRoutes(
         await access.setPrincipalGrants(
           companyId,
           "user",
-          existing.requestingUserId,
+          requestingUserId,
           grants,
           req.actor.userId ?? null
         );
+
+        // Agent-restricted requests have no password/login yet — hand the
+        // approver a one-time sign-in link to relay to the requester
+        // themselves (there's no outbound email provider in this codebase).
+        const restrictedAgentId = extractInviteRestrictedAgentId(invite);
+        if (restrictedAgentId && opts.issueMagicLink && existing.requestEmailSnapshot) {
+          try {
+            magicLinkUrl = await opts.issueMagicLink({
+              email: existing.requestEmailSnapshot,
+              callbackURL: `/agents/${restrictedAgentId}`,
+              baseUrl: requestBaseUrl(req),
+            });
+          } catch (err) {
+            logger.warn(
+              { err, requestId },
+              "Failed to generate magic link for approved agent-restricted join request",
+            );
+          }
+        }
       } else {
         const existingAgents = await agents.list(companyId);
         const managerId = resolveJoinRequestAgentManagerId(existingAgents);
@@ -4295,7 +4459,61 @@ export function accessRoutes(
         }).catch(() => {});
       }
 
-      res.json(toJoinRequestResponse(approved));
+      res.json({ ...toJoinRequestResponse(approved), magicLinkUrl });
+    }
+  );
+
+  // The access link returned by /approve is shown to the approver exactly
+  // once and never persisted (see MagicLinkIssuer) — this lets them fetch a
+  // fresh one on demand for an already-approved agent-restricted request,
+  // e.g. after navigating away before copying the first one.
+  router.post(
+    "/companies/:companyId/join-requests/:requestId/magic-link",
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      const requestId = req.params.requestId as string;
+      await assertCompanyPermission(req, companyId, "joins:approve");
+
+      const existing = await db
+        .select()
+        .from(joinRequests)
+        .where(
+          and(
+            eq(joinRequests.companyId, companyId),
+            eq(joinRequests.id, requestId)
+          )
+        )
+        .then((rows) => rows[0] ?? null);
+      if (!existing) throw notFound("Join request not found");
+      if (existing.requestType !== "human" || existing.status !== "approved") {
+        throw conflict("Only approved human join requests have an access link");
+      }
+      if (!existing.requestEmailSnapshot) {
+        throw conflict("Join request has no email to generate an access link for");
+      }
+
+      const invite = await db
+        .select()
+        .from(invites)
+        .where(eq(invites.id, existing.inviteId))
+        .then((rows) => rows[0] ?? null);
+      if (!invite) throw notFound("Invite not found");
+
+      const restrictedAgentId = extractInviteRestrictedAgentId(invite);
+      if (!restrictedAgentId) {
+        throw conflict("This join request is not restricted to a single agent");
+      }
+      if (!opts.issueMagicLink) {
+        throw conflict("Access links require this instance to run in authenticated mode");
+      }
+
+      const magicLinkUrl = await opts.issueMagicLink({
+        email: existing.requestEmailSnapshot,
+        callbackURL: `/agents/${restrictedAgentId}`,
+        baseUrl: requestBaseUrl(req),
+      });
+
+      res.json({ magicLinkUrl });
     }
   );
 

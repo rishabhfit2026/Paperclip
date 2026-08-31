@@ -9,6 +9,7 @@ import { CompanyAccess, CompanyAccessLegacyRoute } from "./CompanyAccess";
 const listMembersMock = vi.hoisted(() => vi.fn());
 const listJoinRequestsMock = vi.hoisted(() => vi.fn());
 const updateMemberMock = vi.hoisted(() => vi.fn());
+const updateMemberAccessMock = vi.hoisted(() => vi.fn());
 const archiveMemberMock = vi.hoisted(() => vi.fn());
 const listAgentsMock = vi.hoisted(() => vi.fn());
 const listIssuesMock = vi.hoisted(() => vi.fn());
@@ -22,7 +23,8 @@ vi.mock("@/api/access", () => ({
     updateMember: (companyId: string, memberId: string, input: unknown) =>
       updateMemberMock(companyId, memberId, input),
     updateMemberPermissions: vi.fn(),
-    updateMemberAccess: vi.fn(),
+    updateMemberAccess: (companyId: string, memberId: string, input: unknown) =>
+      updateMemberAccessMock(companyId, memberId, input),
     archiveMember: (companyId: string, memberId: string, input: unknown) =>
       archiveMemberMock(companyId, memberId, input),
     approveJoinRequest: vi.fn(),
@@ -161,6 +163,7 @@ describe("CompanyAccess", () => {
       },
     ]);
     updateMemberMock.mockResolvedValue({});
+    updateMemberAccessMock.mockResolvedValue({});
     archiveMemberMock.mockResolvedValue({ reassignedIssueCount: 1 });
     listAgentsMock.mockResolvedValue([
       {
@@ -279,9 +282,10 @@ describe("CompanyAccess", () => {
     });
     await flushReact();
 
-    expect(updateMemberMock).toHaveBeenCalledWith("company-1", "member-1", {
+    expect(updateMemberAccessMock).toHaveBeenCalledWith("company-1", "member-1", {
       membershipRole: "owner",
       status: "active",
+      grants: [],
     });
 
     await act(async () => {

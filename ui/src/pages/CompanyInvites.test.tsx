@@ -14,6 +14,7 @@ const revokeInviteMock = vi.hoisted(() => vi.fn());
 const pushToastMock = vi.hoisted(() => vi.fn());
 const setBreadcrumbsMock = vi.hoisted(() => vi.fn());
 const clipboardWriteTextMock = vi.hoisted(() => vi.fn());
+const listAgentsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/api/access", () => ({
   accessApi: {
@@ -21,6 +22,12 @@ vi.mock("@/api/access", () => ({
     createCompanyInvite: (companyId: string, input: unknown) =>
       createCompanyInviteMock(companyId, input),
     revokeInvite: (inviteId: string) => revokeInviteMock(inviteId),
+  },
+}));
+
+vi.mock("@/api/agents", () => ({
+  agentsApi: {
+    list: (companyId: string) => listAgentsMock(companyId),
   },
 }));
 
@@ -105,6 +112,7 @@ describe("CompanyInvites", () => {
     });
 
     revokeInviteMock.mockResolvedValue(undefined);
+    listAgentsMock.mockResolvedValue([]);
 
     Object.defineProperty(globalThis.navigator, "clipboard", {
       configurable: true,
@@ -199,6 +207,7 @@ describe("CompanyInvites", () => {
       allowedJoinTypes: "human",
       humanRole: "viewer",
       agentMessage: null,
+      restrictToAgentId: null,
     });
     expect(clipboardWriteTextMock).toHaveBeenCalledWith("https://paperclip.local/invite/new-token");
     expect(container.textContent).toContain("Latest invite link");

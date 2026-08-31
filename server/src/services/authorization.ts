@@ -107,6 +107,7 @@ export type AuthorizationDecision = {
     | "allow_company_member"
     | "allow_simple_company_member"
     | "allow_manager_chain"
+    | "allow_member_scope"
     | "inbox_target_user_unresolved"
     | "inbox_management_disabled"
     | "inbox_agent_not_allowed"
@@ -119,6 +120,7 @@ export type AuthorizationDecision = {
     | "deny_policy_restricted"
     | "deny_low_trust_boundary"
     | "deny_scope"
+    | "deny_member_scope"
     | "deny_unsupported_action";
   grant?: {
     principalType: PrincipalType;
@@ -154,6 +156,25 @@ function permissionForAction(action: AuthorizationAction): PermissionKey | null 
   if (action === "issue:comment" || action === "issue:mutate") return null;
   return action;
 }
+
+// Actions a `company:member_scope` grant (agent-subtree restriction for a
+// human company member) governs. Actions outside this set are not
+// agent-resource-shaped (e.g. tools:*, users:*, pipelines:write) and are
+// left to the normal membership/explicit-grant evaluation.
+const MEMBER_SCOPE_GOVERNED_ACTIONS = new Set<AuthorizationAction>([
+  "company_scope:read",
+  "runtime:manage",
+  "secrets:read",
+  "agent:read",
+  "agent:wake",
+  "agent_config:update",
+  "skill_config:update",
+  "issue:read",
+  "issue:comment",
+  "issue:mutate",
+  "project:read",
+  "tasks:assign",
+]);
 
 function canCreateAgentsLegacy(agent: { role: string; permissions: unknown }) {
   if (agent.role === "ceo") return true;
@@ -229,6 +250,7 @@ type AgentAuthorizationRow = {
 type ProjectAuthorizationRow = {
   id: string;
   companyId: string;
+  leadAgentId: string | null;
   executionWorkspacePolicy: unknown;
 };
 type IssueAuthorizationRow = {
@@ -727,6 +749,7 @@ export function authorizationService(db: Db) {
       .select({
         id: projects.id,
         companyId: projects.companyId,
+        leadAgentId: projects.leadAgentId,
         executionWorkspacePolicy: projects.executionWorkspacePolicy,
       })
       .from(projects)
@@ -751,6 +774,51 @@ export function authorizationService(db: Db) {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
+  }
+
+  // Resolves the agent an issue-shaped resource "belongs to" for member-scope
+  // subtree checks: the direct assignee agent, else the lead agent of its
+  // project, else the nearest ancestor issue's assignee/project lead agent.
+  // Returns null when ownership can't be resolved (member-scope treats that
+  // as out-of-scope by default).
+  async function resolveIssueOwningAgentId(input: {
+    issueId?: string | null;
+    projectId?: string | null;
+    parentIssueId?: string | null;
+    assigneeAgentId?: string | null;
+  }): Promise<string | null> {
+    if (input.assigneeAgentId) return input.assigneeAgentId;
+
+    let projectId = input.projectId ?? null;
+    let parentIssueId = input.parentIssueId ?? null;
+
+    if (input.issueId && !projectId) {
+      const issue = await loadIssue(input.issueId);
+      if (issue) {
+        if (issue.assigneeAgentId) return issue.assigneeAgentId;
+        projectId = issue.projectId;
+        parentIssueId ??= issue.parentId;
+      }
+    }
+
+    if (projectId) {
+      const project = await loadProject(projectId);
+      if (project?.leadAgentId) return project.leadAgentId;
+    }
+
+    let cursor = parentIssueId;
+    for (let depth = 0; cursor && depth < 50; depth += 1) {
+      const parent = await loadIssue(cursor);
+      if (!parent) break;
+      if (parent.assigneeAgentId) return parent.assigneeAgentId;
+      if (parent.projectId) {
+        const parentProject = await loadProject(parent.projectId);
+        if (parentProject?.leadAgentId) return parentProject.leadAgentId;
+      }
+      cursor = parent.parentId;
+    }
+
+    return null;
   }
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
@@ -1444,6 +1512,125 @@ export function authorizationService(db: Db) {
       });
     }
 
+    // A `company:member_scope` grant restricts a human company member to a
+    // single agent's org-chart subtree: they can see and act on that agent
+    // and everything reporting up to it, but nothing else in the company.
+    // This governs both visibility (reads) and actions (comment/mutate/
+    // assign) for the action set in MEMBER_SCOPE_GOVERNED_ACTIONS, and is
+    // an absolute ceiling — it's intersected with (not bypassed by) any
+    // other grant the member separately holds for agent config/skill
+    // changes, so scoping can't be worked around by stacking grants.
+    async function decideScopedMember(rootAgentId: string): Promise<AuthorizationDecision> {
+      const denyScope = (explanation: string) =>
+        deny({ action: input.action, reason: "deny_member_scope", explanation });
+      const allowScope = (explanation: string) =>
+        allow({ action: input.action, reason: "allow_member_scope", explanation });
+
+      async function withinSubtree(agentId: string | null | undefined) {
+        if (!agentId) return false;
+        return isAgentInSubtree(db, companyId, rootAgentId, agentId);
+      }
+
+      if (input.action === "company_scope:read") {
+        return denyScope(
+          "Member is restricted to a single agent's subtree; company-wide scope reads are not allowed.",
+        );
+      }
+
+      if (input.action === "runtime:manage" || input.action === "secrets:read") {
+        return denyScope("Agent-subtree restrictions do not grant company-wide privileged actions.");
+      }
+
+      if (input.action === "agent:read" || input.action === "agent:wake") {
+        if (input.resource.type !== "agent") {
+          return denyScope("Agent-subtree restriction check requires an agent resource.");
+        }
+        return (await withinSubtree(input.resource.agentId))
+          ? allowScope("Agent is inside this member's granted agent subtree.")
+          : denyScope("Agent is outside this member's granted agent subtree.");
+      }
+
+      if (input.action === "agent_config:update" || input.action === "skill_config:update") {
+        if (input.resource.type !== "agent") {
+          return denyScope("Agent-subtree restriction check requires an agent resource.");
+        }
+        if (!(await withinSubtree(input.resource.agentId))) {
+          return denyScope("Agent is outside this member's granted agent subtree.");
+        }
+        return input.action === "agent_config:update"
+          ? decideWithProtectedChangeGrants("user", input.actor.userId!, {
+              direct: "agents:configure",
+              suggest: "agents:suggest-changes",
+            })
+          : decideWithProtectedChangeGrants("user", input.actor.userId!, {
+              direct: "skills:create",
+              suggest: "skills:suggest-changes",
+            });
+      }
+
+      if (input.action === "issue:read" || input.action === "issue:comment" || input.action === "issue:mutate") {
+        if (input.resource.type !== "issue") {
+          return denyScope("Agent-subtree restriction check requires an issue resource.");
+        }
+        if (input.resource.assigneeUserId && input.resource.assigneeUserId === input.actor.userId) {
+          return allowScope("Issue is directly assigned to this member.");
+        }
+        const owningAgentId = await resolveIssueOwningAgentId({
+          issueId: input.resource.issueId,
+          projectId: input.resource.projectId,
+          parentIssueId: input.resource.parentIssueId,
+          assigneeAgentId: input.resource.assigneeAgentId,
+        });
+        if (!owningAgentId) {
+          return denyScope("Issue has no owning agent resolvable within this member's granted subtree.");
+        }
+        return (await withinSubtree(owningAgentId))
+          ? allowScope("Issue's owning agent is inside this member's granted agent subtree.")
+          : denyScope("Issue's owning agent is outside this member's granted agent subtree.");
+      }
+
+      if (input.action === "project:read") {
+        const projectId = input.resource.type === "project" || input.resource.type === "issue"
+          ? input.resource.projectId
+          : null;
+        if (!projectId) {
+          return denyScope("Agent-subtree restriction check requires a project resource.");
+        }
+        const project = await loadProject(projectId);
+        if (!project?.leadAgentId) {
+          return denyScope("Project has no lead agent resolvable within this member's granted subtree.");
+        }
+        return (await withinSubtree(project.leadAgentId))
+          ? allowScope("Project's lead agent is inside this member's granted agent subtree.")
+          : denyScope("Project's lead agent is outside this member's granted agent subtree.");
+      }
+
+      if (input.action === "tasks:assign") {
+        if (input.resource.type !== "issue") {
+          return denyScope("Agent-subtree restriction check requires an issue resource for task assignment.");
+        }
+        // resolveIssueOwningAgentId checks the proposed new assigneeAgentId
+        // first; when absent (unassigning, or assigning to a human user)
+        // it falls back to the issue's own context (project lead / nearest
+        // assigned ancestor) so those actions stay allowed for in-subtree
+        // issues without letting the new assignee itself widen the scope.
+        const targetAgentId = await resolveIssueOwningAgentId({
+          issueId: input.resource.issueId,
+          projectId: input.resource.projectId,
+          parentIssueId: input.resource.parentIssueId,
+          assigneeAgentId: input.resource.assigneeAgentId,
+        });
+        if (!targetAgentId) {
+          return denyScope("Task assignment target has no agent resolvable within this member's granted subtree.");
+        }
+        return (await withinSubtree(targetAgentId))
+          ? allowScope("Task assignment target is inside this member's granted agent subtree.")
+          : denyScope("Task assignment target is outside this member's granted agent subtree.");
+      }
+
+      return denyScope(`Agent-subtree restriction has no handling for ${input.action}.`);
+    }
+
     async function denyForAssignmentPolicyIfNeeded(
       policyEffect: AssignmentPolicyEffect,
     ): Promise<AuthorizationDecision | null> {
@@ -1496,6 +1683,18 @@ export function authorizationService(db: Db) {
           reason: "allow_instance_admin",
           explanation: "Allowed because the actor is an instance admin.",
         });
+      }
+      // A `company:member_scope` grant must win over every other board-actor
+      // path below (including the cloud_tenant blanket-membership grant
+      // right after this block) — checked here, before any of them, so an
+      // agent-subtree-restricted member can't get broader access via a
+      // different actor source.
+      if (input.actor.userId && MEMBER_SCOPE_GOVERNED_ACTIONS.has(input.action)) {
+        const memberScopeGrant = await findGrant(companyId, "user", input.actor.userId, "company:member_scope");
+        const memberScopeRootAgentId = readString(memberScopeGrant?.scope?.rootAgentId);
+        if (memberScopeRootAgentId) {
+          return decideScopedMember(memberScopeRootAgentId);
+        }
       }
       // What instance-admin elevation used to give cloud tenant users is
       // replaced by company-scoped visibility: an active membership in the
@@ -2096,8 +2295,19 @@ export function authorizationService(db: Db) {
     return applyResponsibleUserIntersection(input, agentDecision);
   }
 
+  // Cheap lookup for route-level code that needs to know upfront whether a
+  // board user's access is restricted to an agent subtree — e.g. to decide
+  // whether a legacy bypass helper should fall through to a full `decide()`
+  // call instead of its default unconditional allow. Returns the granted
+  // subtree root agent id, or null when the user has no member-scope grant.
+  async function getMemberScopeRootAgentId(companyId: string, userId: string): Promise<string | null> {
+    const grant = await findGrant(companyId, "user", userId, "company:member_scope");
+    return readString(grant?.scope?.rootAgentId);
+  }
+
   return {
     decide,
     decidePrincipalGrant,
+    getMemberScopeRootAgentId,
   };
 }

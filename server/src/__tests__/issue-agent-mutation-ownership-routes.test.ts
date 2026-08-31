@@ -36,6 +36,7 @@ const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
   decide: vi.fn(),
   hasPermission: vi.fn(),
+  getMemberScopeRootAgentId: vi.fn(),
 }));
 
 const mockAgentService = vi.hoisted(() => ({
@@ -402,6 +403,8 @@ describe("agent issue mutation checkout ownership", () => {
           : "Missing permission.",
     }));
     mockAccessService.hasPermission.mockReset();
+    mockAccessService.getMemberScopeRootAgentId.mockReset();
+    mockAccessService.getMemberScopeRootAgentId.mockResolvedValue(null);
     mockAgentService.getById.mockReset();
     mockAgentService.list.mockReset();
     mockAgentService.resolveByReference.mockReset();

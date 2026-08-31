@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -178,8 +179,8 @@ describeEmbeddedPostgres("authorization service", () => {
     await db.delete(companyMemberships);
     await db.delete(instanceUserRoles);
     await db.delete(issues);
-    await db.delete(agents);
     await db.delete(projects);
+    await db.delete(agents);
     await db.delete(companies);
     await db.delete(authUsers);
   });
@@ -2154,5 +2155,241 @@ describeEmbeddedPostgres("authorization service", () => {
       action: "inbox:manage",
       resource: { type: "company", companyId: company.id },
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+  });
+
+  describe("company:member_scope agent-subtree restriction", () => {
+    function boardActor(userId: string) {
+      return { type: "board" as const, userId, source: "session" as const };
+    }
+
+    it("allows reading the granted agent and its subtree, denies siblings", async () => {
+      const company = await createCompany(db, "MemberScopeAgentRead");
+      const root = await createAgent(db, company.id);
+      const scout = await createAgent(db, company.id, { reportsTo: root.id });
+      const scoutChild = await createAgent(db, company.id, { reportsTo: scout.id });
+      const enricher = await createAgent(db, company.id, { reportsTo: root.id });
+      const userId = await createUser(db);
+      await grantUserPermission(db, company.id, userId, "company:member_scope", { rootAgentId: scout.id });
+
+      const access = authorizationService(db);
+      const decide = (agentId: string) =>
+        access.decide({
+          actor: boardActor(userId),
+          action: "agent:read",
+          resource: { type: "agent", companyId: company.id, agentId },
+        });
+
+      await expect(decide(scout.id)).resolves.toMatchObject({ allowed: true, reason: "allow_member_scope" });
+      await expect(decide(scoutChild.id)).resolves.toMatchObject({ allowed: true, reason: "allow_member_scope" });
+      await expect(decide(enricher.id)).resolves.toMatchObject({ allowed: false, reason: "deny_member_scope" });
+      await expect(decide(root.id)).resolves.toMatchObject({ allowed: false, reason: "deny_member_scope" });
+    });
+
+    it("always denies company_scope:read for a scoped member", async () => {
+      const company = await createCompany(db, "MemberScopeCompanyRead");
+      const scout = await createAgent(db, company.id);
+      const userId = await createUser(db);
+      await grantUserPermission(db, company.id, userId, "company:member_scope", { rootAgentId: scout.id });
+
+      await expect(authorizationService(db).decide({
+        actor: boardActor(userId),
+        action: "company_scope:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_member_scope" });
+    });
+
+    it("denies runtime:manage and secrets:read for a scoped member", async () => {
+      const company = await createCompany(db, "MemberScopePrivileged");
+      const scout = await createAgent(db, company.id);
+      const userId = await createUser(db);
+      await grantUserPermission(db, company.id, userId, "company:member_scope", { rootAgentId: scout.id });
+
+      const access = authorizationService(db);
+      await expect(access.decide({
+        actor: boardActor(userId),
+        action: "runtime:manage",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_member_scope" });
+      await expect(access.decide({
+        actor: boardActor(userId),
+        action: "secrets:read",
+        resource: { type: "company", companyId: company.id },
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_member_scope" });
+    });
+
+    it("resolves issue ownership via direct assignee, project lead, and ancestor chain", async () => {
+      const company = await createCompany(db, "MemberScopeIssueRead");
+      const scout = await createAgent(db, company.id);
+      const enricher = await createAgent(db, company.id);
+      const userId = await createUser(db);
+      await grantUserPermission(db, company.id, userId, "company:member_scope", { rootAgentId: scout.id });
+
+      const scoutProject = await createProject(db, company.id, "ScoutProject");
+      await db.update(projects).set({ leadAgentId: scout.id }).where(eq(projects.id, scoutProject.id));
+      const enricherProject = await createProject(db, company.id, "EnricherProject");
+      await db.update(projects).set({ leadAgentId: enricher.id }).where(eq(projects.id, enricherProject.id));
+
+      const directAssignee = await createIssue(db, company.id, { assigneeAgentId: scout.id });
+      const viaProject = await createIssue(db, company.id, { projectId: scoutProject.id });
+      const viaWrongProject = await createIssue(db, company.id, { projectId: enricherProject.id });
+      const ancestor = await createIssue(db, company.id, { assigneeAgentId: scout.id });
+      const viaAncestor = await createIssue(db, company.id, { parentId: ancestor.id });
+      const orphan = await createIssue(db, company.id, {});
+
+      const access = authorizationService(db);
+      const decide = (issue: { id: string; projectId: string | null; parentId: string | null; assigneeAgentId: string | null }) =>
+        access.decide({
+          actor: boardActor(userId),
+          action: "issue:read",
+          resource: {
+            type: "issue",
+            companyId: company.id,
+            issueId: issue.id,
+            projectId: issue.projectId,
+            parentIssueId: issue.parentId,
+            assigneeAgentId: issue.assigneeAgentId,
+            assigneeUserId: null,
+          },
+        });
+
+      await expect(decide(directAssignee)).resolves.toMatchObject({ allowed: true, reason: "allow_member_scope" });
+      await expect(decide(viaProject)).resolves.toMatchObject({ allowed: true, reason: "allow_member_scope" });
+      await expect(decide(viaWrongProject)).resolves.toMatchObject({ allowed: false, reason: "deny_member_scope" });
+      await expect(decide(viaAncestor)).resolves.toMatchObject({ allowed: true, reason: "allow_member_scope" });
+      await expect(decide(orphan)).resolves.toMatchObject({ allowed: false, reason: "deny_member_scope" });
+    });
+
+    it("always allows an issue directly assigned to the scoped member, even outside their subtree", async () => {
+      const company = await createCompany(db, "MemberScopeSelfAssigned");
+      const scout = await createAgent(db, company.id);
+      const enricher = await createAgent(db, company.id);
+      const userId = await createUser(db);
+      await grantUserPermission(db, company.id, userId, "company:member_scope", { rootAgentId: scout.id });
+
+      const selfAssignedOutsideSubtree = await createIssue(db, company.id, { assigneeAgentId: enricher.id });
+      await db.update(issues).set({ assigneeUserId: userId }).where(eq(issues.id, selfAssignedOutsideSubtree.id));
+
+      await expect(authorizationService(db).decide({
+        actor: boardActor(userId),
+        action: "issue:comment",
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: selfAssignedOutsideSubtree.id,
+          projectId: null,
+          parentIssueId: null,
+          assigneeAgentId: enricher.id,
+          assigneeUserId: userId,
+        },
+      })).resolves.toMatchObject({ allowed: true, reason: "allow_member_scope" });
+    });
+
+    it("gates project:read on the project's lead agent subtree, denying projects with no lead agent", async () => {
+      const company = await createCompany(db, "MemberScopeProjectRead");
+      const scout = await createAgent(db, company.id);
+      const enricher = await createAgent(db, company.id);
+      const userId = await createUser(db);
+      await grantUserPermission(db, company.id, userId, "company:member_scope", { rootAgentId: scout.id });
+
+      const scoutProject = await createProject(db, company.id, "ScoutProject");
+      await db.update(projects).set({ leadAgentId: scout.id }).where(eq(projects.id, scoutProject.id));
+      const enricherProject = await createProject(db, company.id, "EnricherProject");
+      await db.update(projects).set({ leadAgentId: enricher.id }).where(eq(projects.id, enricherProject.id));
+      const leaderlessProject = await createProject(db, company.id, "Leaderless");
+
+      const access = authorizationService(db);
+      const decide = (projectId: string) =>
+        access.decide({
+          actor: boardActor(userId),
+          action: "project:read",
+          resource: { type: "project", companyId: company.id, projectId },
+        });
+
+      await expect(decide(scoutProject.id)).resolves.toMatchObject({ allowed: true, reason: "allow_member_scope" });
+      await expect(decide(enricherProject.id)).resolves.toMatchObject({ allowed: false, reason: "deny_member_scope" });
+      await expect(decide(leaderlessProject.id)).resolves.toMatchObject({ allowed: false, reason: "deny_member_scope" });
+    });
+
+    it("gates tasks:assign on the proposed agent target, falling back to issue context when unassigning", async () => {
+      const company = await createCompany(db, "MemberScopeTaskAssign");
+      const scout = await createAgent(db, company.id);
+      const enricher = await createAgent(db, company.id);
+      const userId = await createUser(db);
+      await grantUserPermission(db, company.id, userId, "company:member_scope", { rootAgentId: scout.id });
+
+      const scoutIssue = await createIssue(db, company.id, { assigneeAgentId: scout.id });
+
+      const access = authorizationService(db);
+      await expect(access.decide({
+        actor: boardActor(userId),
+        action: "tasks:assign",
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: scoutIssue.id,
+          projectId: null,
+          parentIssueId: null,
+          assigneeAgentId: enricher.id,
+          assigneeUserId: null,
+        },
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_member_scope" });
+
+      await expect(access.decide({
+        actor: boardActor(userId),
+        action: "tasks:assign",
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: scoutIssue.id,
+          projectId: null,
+          parentIssueId: null,
+          assigneeAgentId: null,
+          assigneeUserId: null,
+        },
+      })).resolves.toMatchObject({ allowed: true, reason: "allow_member_scope" });
+    });
+
+    it("intersects with a separately-granted agents:configure permission instead of bypassing the subtree", async () => {
+      const company = await createCompany(db, "MemberScopeIntersection");
+      const scout = await createAgent(db, company.id);
+      const enricher = await createAgent(db, company.id);
+      const userId = await createUser(db);
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: userId,
+        status: "active",
+        membershipRole: "operator",
+      });
+      await db.insert(principalPermissionGrants).values([
+        {
+          companyId: company.id,
+          principalType: "user",
+          principalId: userId,
+          permissionKey: "company:member_scope",
+          scope: { rootAgentId: scout.id },
+          grantedByUserId: "owner",
+        },
+        {
+          companyId: company.id,
+          principalType: "user",
+          principalId: userId,
+          permissionKey: "agents:configure",
+          scope: null,
+          grantedByUserId: "owner",
+        },
+      ]);
+
+      const access = authorizationService(db);
+      const decide = (agentId: string) =>
+        access.decide({
+          actor: boardActor(userId),
+          action: "agent_config:update",
+          resource: { type: "agent", companyId: company.id, agentId },
+        });
+
+      await expect(decide(scout.id)).resolves.toMatchObject({ allowed: true });
+      await expect(decide(enricher.id)).resolves.toMatchObject({ allowed: false, reason: "deny_member_scope" });
+    });
   });
 });

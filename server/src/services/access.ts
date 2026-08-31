@@ -92,6 +92,10 @@ export function accessService(db: Db) {
     return authorization.decide(input);
   }
 
+  async function getMemberScopeRootAgentId(companyId: string, userId: string): Promise<string | null> {
+    return authorization.getMemberScopeRootAgentId(companyId, userId);
+  }
+
   async function listMembers(companyId: string) {
     return db
       .select()
@@ -782,6 +786,7 @@ export function accessService(db: Db) {
   return {
     isInstanceAdmin,
     decide,
+    getMemberScopeRootAgentId,
     canUser,
     hasPermission,
     getMembership,

@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy, ExternalLink, MailPlus } from "lucide-react";
+import type { Agent } from "@paperclipai/shared";
 import { accessApi } from "@/api/access";
+import { agentsApi } from "@/api/agents";
 import { ApiError } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
@@ -10,6 +12,10 @@ import { useToast } from "@/context/ToastContext";
 import { Link } from "@/lib/router";
 import { queryKeys } from "@/lib/queryKeys";
 import { Badge } from "@/components/ui/badge";
+
+function isAssignableAgent(agent: Agent) {
+  return agent.status !== "terminated" && agent.status !== "pending_approval";
+}
 
 const inviteRoleOptions = [
   {
@@ -51,6 +57,7 @@ export function CompanyInvites() {
   const { pushToast } = useToast();
   const queryClient = useQueryClient();
   const [humanRole, setHumanRole] = useState<"owner" | "admin" | "operator" | "viewer">("operator");
+  const [restrictToAgentId, setRestrictToAgentId] = useState<string | null>(null);
   const [latestInviteUrl, setLatestInviteUrl] = useState<string | null>(null);
   const [latestInviteCopied, setLatestInviteCopied] = useState(false);
   const latestInviteInputRef = useRef<HTMLInputElement | null>(null);
@@ -125,6 +132,12 @@ export function CompanyInvites() {
     ]);
   }, [selectedCompany?.name, setBreadcrumbs]);
 
+  const agentsQuery = useQuery({
+    queryKey: queryKeys.agents.list(selectedCompanyId ?? ""),
+    queryFn: () => agentsApi.list(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
+
   const inviteHistoryQueryKey = queryKeys.access.invites(selectedCompanyId ?? "", "all", INVITE_HISTORY_PAGE_SIZE);
   const invitesQuery = useInfiniteQuery({
     queryKey: inviteHistoryQueryKey,
@@ -151,6 +164,7 @@ export function CompanyInvites() {
         allowedJoinTypes: "human",
         humanRole,
         agentMessage: null,
+        restrictToAgentId,
       }),
     onSuccess: async (invite) => {
       setLatestInviteUrl(invite.inviteUrl);
@@ -262,8 +276,29 @@ export function CompanyInvites() {
           </div>
         </fieldset>
 
+        <label className="block space-y-2 text-sm">
+          <span className="font-medium">Restrict to agent</span>
+          <select
+            className="w-full rounded-md border border-border bg-background px-3 py-2"
+            value={restrictToAgentId ?? ""}
+            onChange={(event) => setRestrictToAgentId(event.target.value || null)}
+          >
+            <option value="">None — grant the role above directly (default)</option>
+            {(agentsQuery.data ?? []).filter(isAssignableAgent).map((agent) => (
+              <option key={agent.id} value={agent.id}>
+                {agent.name} ({agent.role})
+              </option>
+            ))}
+          </select>
+          <span className="block text-xs text-muted-foreground">
+            When set, this invitee will only ever see and act on the chosen agent — not the rest of the company or its other agents. Their request lands in the join request queue for you to approve or reject before they get access.
+          </span>
+        </label>
+
         <div className="rounded-lg border border-border px-4 py-3 text-sm text-muted-foreground">
-          Each invite link is single-use. Human invitees get the selected role immediately after sign-in; agent invites still create a join request for approval.
+          {restrictToAgentId
+            ? "Each invite link is single-use. Because this invite is restricted to a single agent, the invitee's request needs your approval in the join request queue before they get access."
+            : "Each invite link is single-use. Human invitees get the selected role immediately after sign-in; agent invites still create a join request for approval."}
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
@@ -427,6 +462,9 @@ function formatInviteState(state: "active" | "accepted" | "expired" | "revoked")
 
 function formatInviteAudience(invite: Awaited<ReturnType<typeof accessApi.listInvites>>["invites"][number]) {
   if (invite.allowedJoinTypes === "agent") return "Agent";
+  if (invite.restrictedAgentName) {
+    return `${invite.humanRole ?? "Human"} · restricted to ${invite.restrictedAgentName}`;
+  }
   if (invite.allowedJoinTypes === "both") return invite.humanRole ? `Human or agent · ${invite.humanRole}` : "Human or agent";
   return invite.humanRole ?? "Human";
 }
